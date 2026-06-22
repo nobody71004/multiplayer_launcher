@@ -1,4 +1,9 @@
-# runtime state (created by the launcher on first run)
+# SQLite matchmaker runtime DB
+matchmaker.db
+matchmaker.db-shm
+matchmaker.db-wal
+
+# launcher runtime config
 *.saved.json
 *.config.json
 

@@ -70,9 +70,17 @@ See [`game_engine/README.md`](game_engine/README.md). Summary:
 
 ## Where state lives
 
-- **Matchmaker user/session state** is held in the Flask process (in-process).
-  Restart `matchmaking_server.py` and everyone must re-register + re-login.
-  This is intentional for the starter; swap to a real DB in a follow-up.
+- **Matchmaker user/session state** is held in a SQLite database at
+  `./matchmaker.db` by default (path overridable via the `MATCHMAKER_DB`
+  env var or `--db` CLI flag). Restart `matchmaking_server.py` and
+  registered users, tokens, and live-server heartbeats are restored from
+  disk. The schema and concurrency semantics live in
+  [`matchmaker_storage.SqliteStorage`](matchmaker_storage.py). The
+  in-memory variant (`InMemoryStorage`) is used by the test suite --
+  forced via `MATCHMAKER_USE_INMEMORY=1`, which `tests/conftest.py` sets
+  before any test file imports `matchmaking_server`. That conftest line
+  is the migration guard that keeps the existing 26 tests working
+  unchanged.
 - **Launcher config** is `~/.multiplayer_launcher/config.json` (matchmaker URL).
 - **Saved server aliases** are `~/.multiplayer_launcher/saved.json`
   (user-chosen names → server IDs from the matchmaker).

@@ -105,15 +105,16 @@ def test_servers_filters_stale_heartbeats(client, monkeypatch):
     client.post("/api/register", json={"username": "host", "password": "pw1234"})
     tok = client.post("/api/login", json={"username": "host", "password": "pw1234"}).get_json()["token"]
 
-    # Register alive + stale via direct state poke.
+    # Register alive + stale via the Storage indirection (the prior `_lock`+
+    # `_servers` module globals are gone -- routes through `_storage` now).
     import matchmaking_server as ms
-    with ms._lock:
-        now = time.time()
-        ms._servers["alive"] = {"name": "A", "host": "1.1.1.1", "port": 1, "players": 1,
-                                "max_players": 4, "last_heartbeat": now}
-        ms._servers["stale"] = {"name": "S", "host": "2.2.2.2", "port": 1, "players": 1,
-                                "max_players": 4,
-                                "last_heartbeat": now - SERVER_TTL_SEC - 5}
+    now = time.time()
+    ms._storage.upsert_server("alive", {"name": "A", "host": "1.1.1.1", "port": 1,
+                                        "players": 1, "max_players": 4,
+                                        "last_heartbeat": now})
+    ms._storage.upsert_server("stale", {"name": "S", "host": "2.2.2.2", "port": 1,
+                                        "players": 1, "max_players": 4,
+                                        "last_heartbeat": now - SERVER_TTL_SEC - 5})
     srvs = client.get("/api/servers").get_json()["servers"]
     ids = [s["id"] for s in srvs]
     assert "alive" in ids

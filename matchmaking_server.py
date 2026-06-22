@@ -1,14 +1,21 @@
 """Matchmaking REST server.
 
-In-memory state, thread-locked. Exposes `create_app()` so tests can mount the
-Flask test_client in-process. Run as a module for the actual server:
+State is pluggable via matchmaker_storage.default_storage(). See that module
+for the env-var contract; the brief version:
+
+  MATCHMAKER_USE_INMEMORY=1   -> InMemoryStorage  (used by tests via conftest.py)
+  MATCHMAKER_DB=<path>        -> SqliteStorage at <path>
+                                  (default: ./matchmaker.db)
+
+Exposes `create_app()` so tests can mount the Flask test_client in-process:
 
     python matchmaking_server.py --host 127.0.0.1 --port 5000
+    python matchmaking_server.py --db /custom/path.db --port 5000
 
 Endpoints:
     GET  /api/health         -> {ok, ts}
-    POST /api/register       -> 201 / 400 / 409 (user/pw validation)
-    POST /api/login          -> 200 / 401 (token issued)
+    POST /api/register       -> 201 / 400 / 409 (validation)
+    POST /api/login          -> 200 / 401 (token)
     GET  /api/servers        -> 200 (live servers filtered by < TTL)
     POST /api/heartbeat      -> 200 / 400 / 401 (token-authed keepalive)
 """
@@ -17,23 +24,29 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import secrets
 import sys
-import threading
 import time
-from typing import Any, Dict
+from pathlib import Path
 
 from flask import Flask, jsonify, request
+
+from matchmaker_storage import (
+    SqliteStorage,
+    Storage,
+    default_storage,
+)
 
 
 # --- module-level state ------------------------------------------------------
 
-_lock = threading.RLock()
-_users: Dict[str, Dict[str, str]] = {}     # username -> {"pw": <hash>}
-_tokens: Dict[str, str] = {}                # token -> username
-_servers: Dict[str, Dict[str, Any]] = {}     # server_id -> metadata
+SERVER_TTL_SEC = 60.0
 
-SERVER_TTL_SEC = 60.0  # heartbeat older than this is filtered from /api/servers
+# Lazy-resolved at first import. tests/conftest.py sets
+# MATCHMAKER_USE_INMEMORY=1 BEFORE this module is loaded so test runs get
+# InMemoryStorage; production callers get SqliteStorage at ./matchmaker.db.
+_storage: Storage = default_storage()
 
 
 def _hash(pw: str) -> str:
@@ -42,17 +55,23 @@ def _hash(pw: str) -> str:
 
 def _issue_token(username: str) -> str:
     tok = secrets.token_urlsafe(24)
-    with _lock:
-        _tokens[tok] = username
+    _storage.add_token(tok, username)
     return tok
 
 
 def reset_state() -> None:
-    """Test helper: wipe all in-memory state."""
-    with _lock:
-        _users.clear()
-        _tokens.clear()
-        _servers.clear()
+    """Test helper: wipe the active backend (works for InMemoryStorage and
+    SqliteStorage alike -- this is the migration guard)."""
+    _storage.reset()
+
+
+def use_storage(storage: Storage) -> Storage:
+    """Test helper: swap the backend at runtime. Returns the previous backend
+    so callers can restore it."""
+    global _storage
+    prior = _storage
+    _storage = storage
+    return prior
 
 
 # --- app factory -------------------------------------------------------------
@@ -72,10 +91,8 @@ def create_app() -> Flask:
         password = body.get("password") or ""
         if len(username) < 3 or len(password) < 4:
             return jsonify({"error": "invalid credentials"}), 400
-        with _lock:
-            if username in _users:
-                return jsonify({"error": "user exists"}), 409
-            _users[username] = {"pw": _hash(password)}
+        if not _storage.add_user(username, _hash(password)):
+            return jsonify({"error": "user exists"}), 409
         return jsonify({"ok": True, "username": username}), 201
 
     @app.post("/api/login")
@@ -83,30 +100,15 @@ def create_app() -> Flask:
         body = request.get_json(silent=True) or {}
         username = (body.get("username") or "").strip()
         password = body.get("password") or ""
-        with _lock:
-            user = _users.get(username)
-            if not user or user["pw"] != _hash(password):
-                return jsonify({"error": "bad credentials"}), 401
-            tok = _issue_token(username)
+        user = _storage.get_user(username)
+        if not user or user["pw"] != _hash(password):
+            return jsonify({"error": "bad credentials"}), 401
+        tok = _issue_token(username)
         return jsonify({"token": tok, "username": username})
 
     @app.get("/api/servers")
     def list_servers():
-        now = time.time()
-        with _lock:
-            live = [
-                {
-                    "id": sid,
-                    "name": meta.get("name", sid),
-                    "host": meta.get("host", "127.0.0.1"),
-                    "port": int(meta.get("port", 7777)),
-                    "players": int(meta.get("players", 0)),
-                    "max_players": int(meta.get("max_players", 16)),
-                    "last_heartbeat": meta.get("last_heartbeat", now),
-                }
-                for sid, meta in _servers.items()
-                if now - meta.get("last_heartbeat", 0) < SERVER_TTL_SEC
-            ]
+        live = _storage.list_live_servers(time.time(), SERVER_TTL_SEC)
         live.sort(key=lambda s: s["players"], reverse=True)
         return jsonify({"servers": live})
 
@@ -114,20 +116,19 @@ def create_app() -> Flask:
     def heartbeat():
         body = request.get_json(silent=True) or {}
         token = (body.get("token") or "").strip()
-        with _lock:
-            if token not in _tokens:
-                return jsonify({"error": "invalid token"}), 401
-            sid = (body.get("server_id") or "").strip()
-            if not sid:
-                return jsonify({"error": "server_id required"}), 400
-            _servers[sid] = {
-                "name": body.get("name", sid),
-                "host": body.get("host", "127.0.0.1"),
-                "port": int(body.get("port", 7777)),
-                "players": int(body.get("players", 0)),
-                "max_players": int(body.get("max_players", 16)),
-                "last_heartbeat": time.time(),
-            }
+        if _storage.get_token_username(token) is None:
+            return jsonify({"error": "invalid token"}), 401
+        sid = (body.get("server_id") or "").strip()
+        if not sid:
+            return jsonify({"error": "server_id required"}), 400
+        _storage.upsert_server(sid, {
+            "name": body.get("name", sid),
+            "host": body.get("host", "127.0.0.1"),
+            "port": body.get("port", 7777),
+            "players": body.get("players", 0),
+            "max_players": body.get("max_players", 16),
+            "last_heartbeat": time.time(),
+        })
         return jsonify({"ok": True})
 
     @app.errorhandler(404)
@@ -137,11 +138,21 @@ def create_app() -> Flask:
     return app
 
 
+# --- CLI bootstrap -----------------------------------------------------------
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=5000)
+    ap.add_argument(
+        "--db", default=None,
+        help="path to SQLite DB (ignored when MATCHMAKER_USE_INMEMORY=1)",
+    )
     args = ap.parse_args(argv)
+    if args.db is not None and os.environ.get("MATCHMAKER_USE_INMEMORY") != "1":
+        global _storage
+        _storage = SqliteStorage(Path(args.db))
     create_app().run(host=args.host, port=args.port, debug=False)
     return 0
 
