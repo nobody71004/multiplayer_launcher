@@ -14,6 +14,13 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     timeout-minutes: 10
+    env:
+      # Route the matchmaker subprocess to a per-job temp path so:
+      # 1) jobs do not share SQLite WAL state,
+      # 2) the WAL-cleanup-on-Windows path (test_persistence.py's
+      #    autouse fixture + SqliteStorage.close()) is exercised
+      #    cross-platform per the user's explicit ask.
+      MATCHMAKER_DB: ${{ runner.temp }}/ci_matchmaker.db
 
     steps:
       - name: Checkout
@@ -32,7 +39,23 @@ jobs:
           pip install -r requirements.txt
 
       - name: pytest
-        run: python -m pytest tests/ -v
+        run: python -m pytest tests/ -v --tb=short
 
-      - name: start_all.py end-to-end
+      - name: start_all.py against a fresh tmp MATCHMAKER_DB
+        # Runs the full matchmaker subprocess lifecycle (register,
+        # login, heartbeat, servers, stub argv contract) writing to
+        # $MATCHMAKER_DB. After this step exits, the matchmaker
+        # subprocess has terminated and SqliteStorage.close() ran
+        # inside the server process -- so the WAL is checkpointed
+        # on disk and the next step can read the DB cleanly.
         run: python scripts/start_all.py
+
+      - name: verify cross-restart visibility (read the DB from disk)
+        # SECOND Python step = fresh process + fresh sqlite3
+        # connection against the DB the previous matchmaker
+        # subprocess wrote. This is the ONLY place the persistence
+        # story is validated end-to-end -- pytest only validates
+        # the in-memory path (conftest.py forces
+        # MATCHMAKER_USE_INMEMORY=1 to keep the 39-test suite
+        # hermetic).
+        run: python scripts/verify_cross_restart.py "$MATCHMAKER_DB"

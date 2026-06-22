@@ -137,3 +137,118 @@ def test_unknown_route_returns_404_json(client):
     r = client.get("/nope")
     assert r.status_code == 404
     assert r.get_json() == {"error": "not found"}
+
+
+def test_heartbeat_then_visible_end_to_end(tmp_path: Path):
+    """HTTP-level cross-restart persistence over the Flask surface.
+
+    Round 1 -- register a user, login, and POST /api/heartbeat through
+    the Flask `test_client` only (never touches `matchmaker_storage`
+    directly). The /api/heartbeat route serializes the write through
+    `matchmaking_server._storage.upsert_server(...)`, which is the
+    Storage Protocol indirection this test enforces.
+
+    Round 2 -- simulate a matchmaker restart by closing s1 (state
+    flushed), opening a FRESH `SqliteStorage(s1.path)` against the
+    SAME on-disk DB, and swapping it into `matchmaking_server._storage`
+    via the existing `use_storage(...)` test helper. The fresh
+    connection's `get_token_username(...)` and `list_live_servers(...)`
+    re-hydrate the round-1 state from disk.
+
+    Asserts after the restart:
+      - the round-1 token still authenticates the second heartbeat
+        (proves the round-1 user + token survived on disk),
+      - /api/servers returns exactly 1 server with the same id
+        (proves the second heartbeat went through UPSERT, not a
+        side-channel that would have produced a duplicate row).
+
+    Catches any future regression where the Storage indirection is
+    bypassed -- e.g., a /api/heartbeat handler that writes to a
+    module-level dict instead of `_storage.upsert_server(...)`. Such
+    a regression surfaces here as either a 401 second heartbeat
+    (token/user lost) or a duplicate-row count > 1 (sibling write).
+    Per-test `use_storage(...)` swap + restore in `finally` keeps
+    test isolation intact for the rest of the suite.
+    """
+    import matchmaking_server as ms
+    from matchmaker_storage import SqliteStorage
+
+    db_path = tmp_path / "matchmaker.db"
+    server_id = "srv-end-to-end"
+
+    # ---------- round 1: fresh matchmaker boot ----------
+    s1 = SqliteStorage(db_path)
+    prior_s1 = ms.use_storage(s1)
+    try:
+        # The fresh DB has empty tables; reset_state() is an idempotent
+        # no-op here but guards against leftover rows if tmp_path
+        # is somehow shared / pre-populated in the future.
+        ms.reset_state()
+        app1 = ms.create_app()
+        app1.config["TESTING"] = True
+        with app1.test_client() as c1:
+            r = c1.post(
+                "/api/register",
+                json={"username": "alice", "password": "hunter2"},
+            )
+            assert r.status_code == 201, r.get_json()
+
+            token = c1.post(
+                "/api/login",
+                json={"username": "alice", "password": "hunter2"},
+            ).get_json()["token"]
+
+            hb1 = c1.post("/api/heartbeat", json={
+                "token": token,
+                "server_id": server_id,
+                "name": "End-to-End",
+                "host": "127.0.0.1", "port": 7777,
+                "players": 3, "max_players": 16,
+            })
+            assert hb1.status_code == 200, hb1.get_json()
+
+            srvs = c1.get("/api/servers").get_json()["servers"]
+            assert len(srvs) == 1, f"round-1 visibility: {srvs}"
+            assert srvs[0]["id"] == server_id, f"round-1 server id: {srvs}"
+    finally:
+        s1.close()
+        # Restore the InMemoryStorage baseline so the autouse
+        # post-yield `_reset` lands on the suite's default backend.
+        ms.use_storage(prior_s1)
+
+    # ---------- round 2: simulated matchmaker restart ----------
+    # NOTE: do NOT call reset_state() here. The whole point is that
+    # the round-1 user + token + server SURVIVE the restart. Closing
+    # s1 (FLUSHED via close()) and opening a fresh SqliteStorage
+    # against the same file reads the round-1 writes back from disk.
+    s2 = SqliteStorage(db_path)
+    prior_s2 = ms.use_storage(s2)
+    try:
+        app2 = ms.create_app()
+        app2.config["TESTING"] = True
+        with app2.test_client() as c2:
+            hb2 = c2.post("/api/heartbeat", json={
+                "token": token,            # same token from round 1
+                "server_id": server_id,    # UPSERT via Storage Protocol
+                "name": "End-to-End",
+                "host": "127.0.0.1", "port": 7777,
+                "players": 5, "max_players": 16,
+            })
+            assert hb2.status_code == 200, (
+                f"second heartbeat must succeed against s2 (token + "
+                f"user persisted from round 1); got {hb2.status_code} "
+                f"{hb2.get_json()}"
+            )
+
+            srvs = c2.get("/api/servers").get_json()["servers"]
+            assert len(srvs) == 1, (
+                f"post-restart count must be 1 (UPSERT, not INSERT); "
+                f"got {srvs}"
+            )
+            assert srvs[0]["id"] == server_id, (
+                f"post-restart server id must equal round-1 id; "
+                f"got {srvs}"
+            )
+    finally:
+        s2.close()
+        ms.use_storage(prior_s2)
