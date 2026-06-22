@@ -1,0 +1,9 @@
+# runtime state (created by the launcher on first run)
+*.saved.json
+*.config.json
+
+# pytest
+.pytest_cache/
+__pycache__/
+*.pyc
+*.pyo
