@@ -213,3 +213,201 @@ def test_two_clients_heartbeat_and_launcher_lists_both(
         stop_event.set()
         for t in (t_alice, t_bob):
             t.join(timeout=3)
+
+
+def _stress_register(client: MatchClient, username: str, password: str) -> str:
+    """Register + login helper that tolerates a pre-existing username.
+
+    The matchmaker subprocess is module-scoped, so its InMemoryStorage
+    persists across tests in the same module.  Wrapping the register
+    call in a try/except keeps the stress variant idempotent if the
+    module is ever executed twice in-process (e.g. when a developer
+    iterates with pytest --repeat-scope=module).
+    """
+    try:
+        client.register(username, password)
+    except ValueError:
+        pass  # 409 user-exists -> already registered; that's fine
+    return client.login(username, password)
+
+
+@pytest.mark.integration
+def test_many_clients_heartbeat(matchmaker_subprocess: str, record_property) -> None:
+    """Stress variant + perf-budget guard against future regressions.
+
+    Spins up ``n_stubs`` (16, sitting inside the 10..20 range the
+    user asked for) concurrent in-process heartbeat stubs into the
+    same subprocess the ``matchmaker_subprocess`` fixture already
+    booted.  After the stubs have settled, asserts that **all**
+    stubs are present in ``MatchClient.list_servers()`` (well
+    within the 60 s TTL the server enforces), each stub's recorded
+    ``players`` matches its last payload, and that the
+    heartbeat-acceptance p95 latency plus the ``list_servers``
+    read latency stay under explicitly loose ceilings so a slow
+    CI box still passes while a real regression -- e.g.
+    accidentally serializing every heartbeat behind a global lock
+    or re-fetching the whole DB on every list_servers call --
+    trips the guard.
+
+    The perf observation is emitted as both a pytest
+    ``record_property`` (which lands in the JUnit XML report that
+    most CIs scrape, so it shows up in the test artifact
+    without depending on pytest's stderr capture mode) AND
+    as a ``[perf-budget-guard]`` line on ``sys.stderr`` --
+    a human-readable backup for local / dev logs -- so
+    consumers can grep either surface to detect drift over time.
+    """
+    base_url = matchmaker_subprocess
+
+    n_stubs = 16
+    sweep_delay_seconds = 0.25
+    settle_seconds = 2.5
+    heartbeat_p95_budget_ms = 250.0
+    list_servers_budget_ms = 250.0
+
+    # Read-only MatchClient for the listing check; threads each
+    # use their own MatchClient so we don't share a ConnectionPool
+    # across 16 concurrent stubs.
+    observer = MatchClient(base_url=base_url)
+    assert observer.health(), "/api/health should be 200"
+
+    stop_event = threading.Event()
+    threads: list[threading.Thread] = []
+    heartbeat_latencies_ms: list[float] = []
+    latencies_lock = threading.Lock()
+
+    def _stub(idx: int) -> None:
+        username = f"stress-user-{idx:02d}"
+        password = f"stress-pw-{idx:02d}"
+        server_id = f"stress-server-{idx:02d}"
+        # 1..4, distinct counts so listing order is verifiable
+        players = (idx % 4) + 1
+
+        client = MatchClient(base_url=base_url)
+        token = _stress_register(client, username, password)
+        assert token, f"login failed for {username}"
+
+        deadline = time.monotonic() + settle_seconds
+        while time.monotonic() < deadline and not stop_event.is_set():
+            t0 = time.monotonic()
+            try:
+                r = requests.post(
+                    f"{base_url}/api/heartbeat",
+                    json={
+                        "token": token,
+                        "server_id": server_id,
+                        "name": f"stub-{server_id}",
+                        "host": "127.0.0.1",
+                        "port": 7777,
+                        "players": players,
+                        "max_players": 16,
+                    },
+                    timeout=2.0,
+                )
+                latency_ms = (time.monotonic() - t0) * 1000.0
+                if r.status_code == 200:
+                    with latencies_lock:
+                        heartbeat_latencies_ms.append(latency_ms)
+            except requests.exceptions.RequestException:
+                pass
+            time.sleep(sweep_delay_seconds)
+
+    for i in range(n_stubs):
+        t = threading.Thread(target=_stub, args=(i,), daemon=True)
+        threads.append(t)
+        t.start()
+
+    try:
+        # Give every stub a moment to land its first heartbeat so the
+        # read-side measurement catches a steady-state mix rather than
+        # a cold-start spike.
+        time.sleep(0.4)
+
+        # Authoritative read-side measurement: list_servers latency
+        # with the full n_stubs corpus sitting in the in-memory backend.
+        t0 = time.monotonic()
+        servers = observer.list_servers()
+        list_servers_latency_ms = (time.monotonic() - t0) * 1000.0
+
+        # (1) Correctness: every stress stub is listed within the TTL.
+        expected_ids = {f"stress-server-{i:02d}" for i in range(n_stubs)}
+        listed_ids = {s.get("id") for s in servers}
+        missing = expected_ids - listed_ids
+        assert not missing, (
+            f"missing stress stubs (TTL=60s should keep all {n_stubs}): "
+            f"{sorted(missing)}"
+        )
+
+        # (2) Per-stub payload sanity: players matches each stub's
+        # last heartbeat.  This catches "threads fired but never
+        # landed" as well as "list_servers returned stale entries".
+        players_by_id = {s.get("id"): s.get("players") for s in servers}
+        for i in range(n_stubs):
+            sid = f"stress-server-{i:02d}"
+            assert players_by_id.get(sid) == (i % 4) + 1, (
+                f"{sid} players={players_by_id.get(sid)!r}, "
+                f"expected {(i % 4) + 1}"
+            )
+
+        # (3) Compute the heartbeat p95 so we can both assert against
+        # the budget below AND emit the observation (next block)
+        # regardless of whether the asserts trip.  Hoisting the
+        # emission appears BEFORE the asserts so a regression that
+        # trips the guard leaves the trip numbers in the JUnit XML
+        # artifact, not silently discards its own evidence.
+        p95_value: float | None = None
+        sorted_latencies: list[float] = []
+        if heartbeat_latencies_ms:
+            sorted_latencies = sorted(heartbeat_latencies_ms)
+            p95_index = max(0, int(round(0.95 * (len(sorted_latencies) - 1))))
+            p95_value = sorted_latencies[p95_index]
+
+        # (4) Surface the perf-budget observation FIRST.  When this
+        # test fails (a regression tripped a guard), pytest still
+        # flushes the JUnit XML + stderr below with the numbers that
+        # tripped it.  Keys are snake_case + self-explanatory; the
+        # heartbeat_p95_ms becomes "n/a" when no heartbeats
+        # accepted, matching the stderr sentinel so both surfaces
+        # present the same string to a downstream consumer.
+        record_property(
+            "perf_budget_guard",
+            {
+                "n_stubs": n_stubs,
+                "heartbeats_accepted": len(heartbeat_latencies_ms),
+                "heartbeat_p95_ms": p95_value if p95_value is not None else "n/a",
+                "list_servers_ms": list_servers_latency_ms,
+                "heartbeat_p95_ms_budget": heartbeat_p95_budget_ms,
+                "list_servers_ms_budget": list_servers_budget_ms,
+            },
+        )
+        p95_str = f"{p95_value:.1f}" if p95_value is not None else "n/a"
+        sys.stderr.write(
+            f"\n[perf-budget-guard] n_stubs={n_stubs} "
+            f"heartbeats_accepted={len(heartbeat_latencies_ms)} "
+            f"heartbeat_p95_ms={p95_str} "
+            f"list_servers_ms={list_servers_latency_ms:.1f} "
+            f"(hb_p95_budget_ms={heartbeat_p95_budget_ms:.0f} "
+            f"list_budget_ms={list_servers_budget_ms:.0f})\n"
+        )
+
+        # (5) Perf-budget assert for heartbeat p95.
+        # Genuinely serial per-process code (e.g. an accidental global
+        # lock around the storage backend) would push p95 well past
+        # 250 ms when 16 concurrent stubs are pounding the endpoint.
+        if heartbeat_latencies_ms:
+            assert p95_value < heartbeat_p95_budget_ms, (
+                f"heartbeat p95 too slow under stress: "
+                f"{p95_value:.1f} ms (n={len(sorted_latencies)}, "
+                f"budget {heartbeat_p95_budget_ms:.0f} ms)"
+            )
+
+        # (6) Perf-budget assert for the read-side listing latency.
+        assert list_servers_latency_ms < list_servers_budget_ms, (
+            f"list_servers with {n_stubs} live stubs took "
+            f"{list_servers_latency_ms:.1f} ms "
+            f"(budget {list_servers_budget_ms:.0f} ms)"
+        )
+    finally:
+        stop_event.set()
+        for t in threads:
+            t.join(timeout=3)

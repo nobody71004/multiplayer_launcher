@@ -17,3 +17,24 @@ session.
 import os
 
 os.environ.setdefault("MATCHMAKER_USE_INMEMORY", "1")
+
+
+import pytest
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Register custom pytest markers used by this test suite.
+
+    Markers are declared up-front so a marker-based selector like
+    ``pytest -m 'not integration'`` (used by the dedicated
+    ``integration`` CI job in .github/workflows/ci.yml) runs
+    without "unknown marker" warnings at collection time.
+    See ``tests/test_multi_client_integration.py`` for the
+    consumer of these markers.
+    """
+    config.addinivalue_line(
+        "markers",
+        "integration: marks slow multi-subprocess integration tests "
+        "(deselect with 'pytest -m \"not integration\"' to skip "
+        "the matchmaker subprocess boot in fast unit loops)",
+    )

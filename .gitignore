@@ -12,3 +12,8 @@ matchmaker.db-wal
 __pycache__/
 *.pyc
 *.pyo
+
+
+# local pytest artifacts
+junit.xml
+junit-*.xml
