@@ -4,6 +4,14 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  schedule:
+    # Nightly 06:00 UTC cron provides the ambient-drift probe
+    # for the perf-budget-guard regression detector: even when
+    # no human pushes, this run archives a fresh
+    # junit-integration.xml that the trend-building step
+    # (last step in the integration job) pulls back into the
+    # rolling 30-run trend table.
+    - cron: '0 6 * * *'
 
 jobs:
   test:
@@ -69,6 +77,11 @@ jobs:
     # the multi-stub stress variant advertises. Run on ubuntu-latest
     # only since the assertion (localhost InMemoryStorage) is
     # OS-independent.
+    permissions:
+      # Least-privilege for the trend step: it only needs to read
+      # action artifacts via the GitHub REST API. Everything else
+      # (contents, packages, deployments, etc.) is implicit-deny.
+      actions: read
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -105,3 +118,23 @@ jobs:
         with:
           name: integration-junit
           path: junit-integration.xml
+
+
+      - name: build perf-budget trend (last 30 nightly runs)
+        # A flaky GitHub API hiccup on a single artifact MUST NOT
+        # red-light the whole nightly integration job. The trend
+        # step is best-effort: emit an empty row or skip a run, but
+        # never fail the build -- the perf-budget-guard assertion
+        # itself already ran in the pytest step above and the JUnit
+        # XML is already archived by the prior step with `if: always()`.
+        continue-on-error: true
+        # Only on `schedule` so the trend table reflects ambient
+        # drift independent of pushes -- a freshly-pushed run has
+        # no prior nightly artifacts to compare against, so
+        # running on push would either no-op or produce a 1-row
+        # table that's noise.
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: python scripts/perf_budget_trend.py
