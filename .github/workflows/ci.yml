@@ -1,6 +1,6 @@
 name: ci
 
-on:
+"on":
   push:
     branches: [main]
   workflow_dispatch:
@@ -28,7 +28,7 @@ jobs:
       # 2) the WAL-cleanup-on-Windows path (test_persistence.py's
       #    autouse fixture + SqliteStorage.close()) is exercised
       #    cross-platform per the user's explicit ask.
-      MATCHMAKER_DB: ${{ runner.temp }}/ci_matchmaker.db
+      MATCHMAKER_DB: ${{ github.workspace }}/.tmp/ci_matchmaker.db
 
     steps:
       - name: Checkout
@@ -85,7 +85,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      MATCHMAKER_DB: ${{ runner.temp }}/ci_matchmaker_integration.db
+      MATCHMAKER_DB: ${{ github.workspace }}/.tmp/ci_matchmaker_integration.db
     steps:
       - name: Checkout
         uses: actions/checkout@v4
