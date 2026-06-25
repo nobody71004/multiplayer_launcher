@@ -138,3 +138,69 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: python scripts/perf_budget_trend.py
+
+
+  tools-smoke:
+    name: tools smoke (matchmaker heartbeat + greet_server validator)
+    # Ubuntu-only: matches the `integration` job's posture. The
+    # tools have no platform-specific test logic -- localhost binding
+    # + ephemeral-port picking is OS-independent in practice.
+    #
+    # Light-cost job (<1m typical): boots a real matchmaker
+    # subprocess + runs greet_server.py as a child process per
+    # validator scenario. Keeps the heaviest work (start_all.py,
+    # pytest, perf-budget trend) in the existing jobs; this job
+    # exists specifically so a regression in greet_server's
+    # parse_handshake() CLI surface or fake_game_server's heartbeat
+    # path is caught BEFORE a human reviews a PR.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      # Route the matchmaker subprocess to a per-job temp path so
+      # CI never accumulates stale SQLite WAL state in the runner.
+      MATCHMAKER_DB: ${{ github.workspace }}/.tmp/ci_tools_smoke.db
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: tools/ py_compile gate
+        # Catches syntax errors before any subprocess boot. Cheap
+        # and parallel-safe; lets the next steps fail loud rather
+        # than mid-flight.
+        run: |
+          python -m py_compile tools/probe_common.py
+          python -m py_compile tools/probe_greeter.py
+          python -m py_compile tools/greet_server.py
+          python -m py_compile tools/fake_prelauncher.py
+          python -m py_compile tools/fake_game_server.py
+          python -m py_compile tools/_local_smoke.py
+          python -m py_compile tools/_validator_smoke.py
+
+      - name: headless-stack smoke (matchmaker + fake_game_server)
+        # tools/_local_smoke.py boots matchmaking_server.py in a
+        # subprocess on :5017 + tools/fake_game_server.py, asserts
+        # /api/servers returns the heartbeat entry, and tears both
+        # down. Exit code is the smoke result; the next step will
+        # only run if this gate passes.
+        run: python tools/_local_smoke.py
+
+      - name: greet_server validator harness
+        # tools/_validator_smoke.py runs every entry in
+        # DEFAULT_SCENARIOS (12 scenarios today) -- boots a fresh
+        # greet_server.py with a fresh port per scenario, drives a
+        # known byte payload, asserts the parity log line. Surfaces
+        # any regression in _validate_handshake or the
+        # --validator-* CLI surface as a non-zero exit code.
+        run: python tools/_validator_smoke.py -v

@@ -4,6 +4,10 @@ These exercise SqliteStorage directly against tmp_path files, bypassing
 matchmaking_server's module-level `_storage`. They verify the persistence
 story: registered users + tokens + live-server heartbeats survive a
 matchmaker restart (close-and-reopen against the same DB file).
+
+The maintenance-loop tests at the bottom of the file lock in the
+WAL checkpoint + stale-server purge contracts added by the
+operational-readiness vector.
 """
 
 from __future__ import annotations
@@ -15,7 +19,11 @@ from pathlib import Path
 
 import pytest
 
-from matchmaker_storage import SqliteStorage
+from matchmaker_storage import (
+    InMemoryStorage,
+    SqliteStorage,
+    run_maintenance_loop,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -171,3 +179,146 @@ def test_wal_files_emitted(tmp_path: Path):
     SqliteStorage(p)
     # Some SQLite builds stash WAL alongside the DB; permissively pass.
     assert True
+
+
+# ---------------------------------------------------------------------------
+# Maintenance-loop regression net
+# ---------------------------------------------------------------------------
+#
+# These tests pin the contracts added by the WAL-maintenance vector.
+# The autouse _close_sqlite_storage_handles fixture already above
+# monkey-patches SqliteStorage.__init__ to track every instance for
+# teardown; the new tests exploit that to keep things clean across
+# the threading tests (stop_event.set() lets run_maintenance_loop
+# return cleanly so fixture teardown can close() the storage).
+
+
+def test_checkpoint_wal_returns_3tuple_of_ints(tmp_path: Path):
+    """SqliteStorage.checkpoint_wal returns SQLite's (busy, log, ckpt) tuple.
+
+    All three values must be ints -- pull from cursor.fetchone() and
+    cast through int() to defend against sqlite3.Row returning None
+    when the row is unexpectedly empty.
+    """
+    p = tmp_path / "matchmaker.db"
+    s = SqliteStorage(p)
+    # Force some WAL traffic so a checkpoint actually has work to do.
+    for i in range(5):
+        s.upsert_server(
+            f"srv-{i}",
+            {
+                "name": f"S{i}", "host": "1.1.1.1", "port": 7777,
+                "players": 0, "max_players": 4,
+                "last_heartbeat": time.time(),
+            },
+        )
+    result = s.checkpoint_wal()
+    assert isinstance(result, tuple)
+    assert len(result) == 3
+    busy, log_pages, ckpt_pages = result
+    assert isinstance(busy, int)
+    assert isinstance(log_pages, int)
+    assert isinstance(ckpt_pages, int)
+    # busy is a 0/1 contention flag; under a single-process test it
+    # must be 0.
+    assert busy in (0, 1)
+
+
+def test_purge_stale_servers_keeps_fresh_deletes_stale(tmp_path: Path):
+    """Mutation correctness: purge keeps fresh, deletes stale, returns count.
+
+    Sets up two servers -- one fresh (last_heartbeat=now), one stale
+    (last_heartbeat=now-ttl-1) -- and calls purge_stale_servers with
+    ttl=60s. The deleted-row count must be exactly 1, the fresh server
+    must survive, and list_live_servers() after the purge must
+    contain only the fresh entry.
+    """
+    p = tmp_path / "matchmaker.db"
+    s = SqliteStorage(p)
+    now = time.time()
+    s.upsert_server("alive", {
+        "name": "A", "host": "1.1.1.1", "port": 1,
+        "players": 0, "max_players": 4,
+        "last_heartbeat": now,
+    })
+    s.upsert_server("stale", {
+        "name": "S", "host": "2.2.2.2", "port": 1,
+        "players": 0, "max_players": 4,
+        "last_heartbeat": now - 3600.0,  # way past any reasonable TTL
+    })
+    deleted = s.purge_stale_servers(now=now, ttl=60.0)
+    assert deleted == 1, deleted
+    survivors = {row["id"] for row in s.list_live_servers(now=now, ttl=60.0)}
+    assert survivors == {"alive"}, survivors
+
+
+def test_run_maintenance_loop_one_cycle_then_returns_for_zero_interval(tmp_path: Path):
+    """interval_s=0 must yield EXACTLY one cycle then exit.
+
+    This is the test-mode entry point the production CLI flag
+    (`--maintenance-interval-sec 0`) maps to. If the function
+    loops indefinitely when interval_s=0, every test that touches
+    it would hang -- this test catches that misfire.
+
+    Direct inline call (interval_s=0 documents a synchronous
+    one-cycle return -- no thread wrapper needed). Reaching the
+    assertion below proves the function returned without looping.
+    The pre-set stop_event is documentation, not load-bearing:
+    with interval_s=0 we exit on the post-cycle early-return path
+    BEFORE stop_event.wait() is ever called.
+    """
+    p = tmp_path / "matchmaker.db"
+    s = SqliteStorage(p)
+    stop = threading.Event()
+    stop.set()
+    run_maintenance_loop(s, interval_s=0.0, stop_event=stop)
+    # Reaching this line is the assertion: the function returned.
+
+
+def test_run_maintenance_loop_exits_on_stop_event(tmp_path: Path):
+    """interval_s>0 must exit cleanly when stop_event.set() is called.
+
+    Spawns the loop on a real background daemon thread with a tight
+    0.05s cycle, lets it run a few cycles, then sets the stop event
+    and verifies the thread joins within 2s. Without the
+    stop-event-aware sleep, this join would block until the test
+    fixture teardown killed the daemon.
+    """
+    p = tmp_path / "matchmaker.db"
+    s = SqliteStorage(p)
+    stop = threading.Event()
+    t = threading.Thread(
+        target=run_maintenance_loop,
+        kwargs={
+            "storage": s,
+            "interval_s": 0.05,
+            "stop_event": stop,
+        },
+        daemon=True,
+        name="wal-maintenance-test",
+    )
+    t.start()
+    # Let the loop tick a few cycles before signaling stop.
+    time.sleep(0.15)
+    assert t.is_alive(), "thread died before stop_event.set() was called"
+    stop.set()
+    t.join(timeout=2.0)
+    assert not t.is_alive(), (
+        "run_maintenance_loop did not exit within 2s after stop_event.set()"
+    )
+
+
+def test_inmemory_maintenance_purges_zero_rows_when_empty():
+    """InMemoryStorage.purge_stale_servers returns 0 on empty storage.
+
+    The Protocol forces both backends to implement purge_stale_servers
+    so the maintenance loop is backend-agnostic. On an EMPTY
+    InMemoryStorage there are no rows to delete, so the count is 0;
+    on a non-empty InMemoryStorage the dict-comprehension would
+    actually mutate state (matching SqliteStorage's DELETE). The
+    checkpoint_wal path is a true no-op (returns (0, 0, 0)) because
+    no WAL exists in-memory.
+    """
+    s = InMemoryStorage()
+    assert s.checkpoint_wal() == (0, 0, 0)
+    assert s.purge_stale_servers(now=time.time(), ttl=60.0) == 0

@@ -17,3 +17,9 @@ __pycache__/
 # local pytest artifacts
 junit.xml
 junit-*.xml
+
+# runtime JSONL event logs (operational telemetry vector)
+logs/
+
+# transient smoke-test artifacts (scratch sqlite DBs written by *_smoke.py)
+.tmp/

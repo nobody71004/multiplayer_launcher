@@ -139,6 +139,100 @@ def test_unknown_route_returns_404_json(client):
     assert r.get_json() == {"error": "not found"}
 
 
+def test_heartbeat_malformed_token_is_401(client):
+    """A token that doesn't match any issued token must be 401 (not 400).
+
+    Distinct from test_heartbeat_requires_token (which omits the token
+    entirely) and from test_heartbeat_empty_token_is_401 below. This
+    covers the 'token present but garbage' path -- the most common
+    real-world bug shape when an operator scrambles a token in a
+    config file.
+    """
+    assert client.post("/api/heartbeat", json={
+        "token": "not-a-real-token-aaaa", "server_id": "s1",
+    }).status_code == 401
+
+
+def test_heartbeat_empty_token_is_401(client):
+    """Empty-string token must also be 401, not 200.
+
+    Distinct from 'missing token' (key absent) -- both should reject
+    but with different request shapes, so we exercise both.
+    """
+    assert client.post("/api/heartbeat", json={
+        "token": "", "server_id": "s1",
+    }).status_code == 401
+
+
+def test_heartbeat_missing_host_uses_default(client):
+    """Missing `host` falls back to 127.0.0.1 (current contract).
+
+    The /api/heartbeat handler applies a default rather than
+    rejecting with 400, so a heartbeat with no host must succeed
+    and the server entry must round-trip the default. If this ever
+    changes to hard-required, the assertion below catches it.
+    """
+    client.post("/api/register", json={"username": "host", "password": "pw1234"})
+    tok = client.post("/api/login", json={"username": "host", "password": "pw1234"}).get_json()["token"]
+    r = client.post("/api/heartbeat", json={
+        "token": tok, "server_id": "no-host",
+        "port": 7777, "players": 1, "max_players": 4,
+    })
+    assert r.status_code == 200, r.get_json()
+    srvs = client.get("/api/servers").get_json()["servers"]
+    match = next((s for s in srvs if s["id"] == "no-host"), None)
+    assert match is not None
+    assert match["host"] == "127.0.0.1"
+
+
+def test_heartbeat_missing_port_uses_default(client):
+    """Missing `port` falls back to 7777 (current contract).
+
+    Symmetric to test_heartbeat_missing_host_uses_default -- pins the
+    fallback behaviour so a future 'make port required' refactor
+    surfaces here instead of silently breaking live heartbeats.
+    """
+    client.post("/api/register", json={"username": "host", "password": "pw1234"})
+    tok = client.post("/api/login", json={"username": "host", "password": "pw1234"}).get_json()["token"]
+    r = client.post("/api/heartbeat", json={
+        "token": tok, "server_id": "no-port",
+        "host": "10.0.0.1", "players": 1, "max_players": 4,
+    })
+    assert r.status_code == 200, r.get_json()
+    srvs = client.get("/api/servers").get_json()["servers"]
+    match = next((s for s in srvs if s["id"] == "no-port"), None)
+    assert match is not None
+    assert match["port"] == 7777
+
+
+def test_servers_empty_after_register_no_heartbeat(client):
+    """A user-with-token but no heartbeats must yield /api/servers == [].
+
+    Pinpoints: a regression where /api/heartbeat's UPSERT leaves a
+    tombstone (last_heartbeat = None) that would surface as a
+    ghost row in /api/servers. With no heartbeats ever sent, the
+    list MUST be empty -- not silent, not [None], not a placeholder.
+    """
+    client.post("/api/register", json={"username": "hostless", "password": "pw1234"})
+    tok = client.post("/api/login", json={"username": "hostless", "password": "pw1234"}).get_json()["token"]
+    assert tok, "token issuance must work"
+    srvs = client.get("/api/servers").get_json()["servers"]
+    assert srvs == [], srvs
+
+
+def test_health_returns_positive_ts_in_window(client):
+    """/api/health's ts must be reasonably recent (within last 5s).
+
+    Anchors the contract that `ts` is unix-seconds-utc-now and not,
+    say, a hardcoded constant or a millisecond timestamp. If the
+    clock source ever drifts, this catches it.
+    """
+    before = int(time.time())
+    r = client.get("/api/health").get_json()
+    after = int(time.time())
+    assert before - 5 <= r["ts"] <= after + 5, (before, r["ts"], after)
+
+
 def test_heartbeat_then_visible_end_to_end(tmp_path: Path):
     """HTTP-level cross-restart persistence over the Flask surface.
 

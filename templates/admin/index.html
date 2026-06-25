@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Multiplayer Launcher &mdash; Admin Log Viewer</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+        Roboto, sans-serif;
+      background: #0e1116;
+      color: #d1d5db;
+      margin: 0;
+      padding: 1em 1.4em;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      padding-bottom: 0.5em;
+      border-bottom: 1px solid #2d2d34;
+    }
+    header h1 {
+      font-size: 1.05em;
+      margin: 0;
+      color: #f1f5f9;
+      font-weight: 600;
+    }
+    header .meta {
+      font-size: 0.85em;
+      color: #94a3b8;
+    }
+    header button {
+      background: #1f2937;
+      color: #d1d5db;
+      border: 1px solid #374151;
+      padding: 0.3em 0.8em;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 0.85em;
+    }
+    header button:hover { background: #374151; }
+    pre#logs {
+      font-family: "JetBrains Mono", Menlo, Consolas, monospace;
+      font-size: 0.78em;
+      line-height: 1.5;
+      padding: 0.8em;
+      background: #1a1f2e;
+      border-radius: 4px;
+      margin-top: 0.8em;
+      max-height: calc(100vh - 6em);
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .lev-info  { color: #38bdf8; }
+    .lev-warn  { color: #fbbf24; font-weight: 600; }
+    .lev-error { color: #f87171; font-weight: 600; }
+    .meta-ts   { color: #94a3b8; }
+    .row-extras { color: #94a3b8; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Multiplayer Launcher &mdash; Admin Log Viewer</h1>
+    <div class="meta">
+      <span id="last-fetch">loading&hellip;</span>
+      &nbsp;
+      <button onclick="pollLogs()">Refresh now</button>
+    </div>
+  </header>
+  <pre id="logs">Loading recent logs&hellip;</pre>
+  <script>
+    const LEV_CLASS = {
+      info:  "lev-info",
+      warn:  "lev-warn",
+      error: "lev-error",
+    };
+    let lastSince = null;
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c => (
+        {"&": "&amp;", "<": "&lt;", ">": "&gt;",
+         "\"": "&quot;", "'": "&#39;"}[c]
+      ));
+    }
+
+    async function pollLogs() {
+      const url = "/api/logs?limit=200" +
+        (lastSince ? "&since=" + encodeURIComponent(lastSince) : "");
+      try {
+        const r = await fetch(url, { cache: "no-store" });
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const j = await r.json();
+        const evs = j.events || [];
+        if (evs.length === 0) {
+          document.getElementById("logs").textContent =
+            "(no events in window)";
+          document.getElementById("last-fetch").textContent =
+            "fetched: (empty)";
+          return;
+        }
+        const lines = [];
+        for (const ev of evs) {
+          const lvl = String(ev.level || "info").toLowerCase();
+          const cls = LEV_CLASS[lvl] || "lev-info";
+          const extras = Object.keys(ev)
+            .filter(k => !["ts", "level", "message"].includes(k))
+            .filter(k => ev[k] !== null && ev[k] !== undefined)
+            .map(k => k + "=" + String(ev[k]));
+          lines.push(
+            `<span class="meta-ts">${escapeHtml(ev.ts || "")}</span> ` +
+            `<span class="${cls}">[${escapeHtml((ev.level || "info").toUpperCase())}]</span> ` +
+            escapeHtml(ev.message || "") +
+            (extras.length
+              ? ` <span class="row-extras">${escapeHtml(extras.join(" "))}</span>`
+              : "")
+          );
+          if (ev.ts && (!lastSince || ev.ts > lastSince)) {
+            lastSince = ev.ts;
+          }
+        }
+        document.getElementById("logs").innerHTML = lines.join("\n");
+        document.getElementById("last-fetch").textContent =
+          "fetched: " + new Date().toLocaleTimeString() +
+          " (" + evs.length + " events)";
+      } catch (e) {
+        document.getElementById("last-fetch").textContent =
+          "fetch error: " + e.message;
+      }
+    }
+
+    pollLogs();
+    setInterval(pollLogs, 2000);
+  </script>
+</body>
+</html>

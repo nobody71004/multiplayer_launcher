@@ -49,6 +49,29 @@ class Storage(Protocol):
         without backend-specific branching.
         """
         ...
+    def checkpoint_wal(self) -> "Tuple[int, int, int]":
+        """Force a WAL checkpoint.
+
+        Returns a 3-tuple ``(busy, log_pages, checkpointed_pages)``
+        matching SQLite's ``PRAGMA wal_checkpoint`` return shape:
+          - ``busy=1`` means another connection had the WAL pinned
+            during the call; cross-cycle retry (the next maintenance
+            cycle will try again) is the right response -- never
+            spin or back-off in-process under contention.
+          - ``log_pages`` and ``checkpointed_pages`` are integer page
+            counts (zero on the in-memory backend).
+        """
+        ...
+    def purge_stale_servers(self, now: float, ttl: float) -> int:
+        """Hard-delete server rows whose ``last_heartbeat`` is older than
+        ``now - ttl``. Distinct from ``list_live_servers`` (which is
+        non-destructive on read) -- this is the data-layer cleanup the
+        maintenance loop drives.
+
+        Returns the count of rows deleted so the caller can
+        threshold-log only when there's actual work.
+        """
+        ...
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +133,22 @@ class InMemoryStorage:
                 for sid, meta in self._servers.items()
                 if now - float(meta.get("last_heartbeat", 0)) < ttl
             ]
+
+    def checkpoint_wal(self) -> "Tuple[int, int, int]":
+        # InMemoryStorage has no WAL -- return a zero tuple so the
+        # maintenance loop can treat both backends uniformly without
+        # isinstance branching.
+        return (0, 0, 0)
+
+    def purge_stale_servers(self, now: float, ttl: float) -> int:
+        with self._lock:
+            before = len(self._servers)
+            self._servers = {
+                sid: meta
+                for sid, meta in self._servers.items()
+                if now - float(meta.get("last_heartbeat", 0)) < ttl
+            }
+            return before - len(self._servers)
 
     def close(self) -> None:
         # InMemoryStorage has no OS handles to release. close() exists for
@@ -262,6 +301,46 @@ class SqliteStorage:
                 for row in rows
             ]
 
+    def checkpoint_wal(self) -> "Tuple[int, int, int]":
+        """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` and return SQLite's 3-tuple.
+
+        ``TRUNCATE`` is the right mode for a maintenance sweep -- it
+        CHECKPOINTs AND truncates the -wal file back to zero length
+        (vs. ``PASSIVE`` which leaves WAL intact and ``FULL`` which
+        extends the lock window). The 5-minute default cadence in the
+        CLI loop keeps each call short enough that contention with a
+        concurrent heartbeat is rare.
+
+        Per-instance RLock serializes the PRAGMA against any
+        in-flight add_user / upsert_server / list_live_servers call,
+        so a heartbeat mid-checkpoint waits at most one cycle.
+        """
+        with self._lock, self._conn:
+            cur = self._conn.cursor()
+            cur.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            row = cur.fetchone()
+            # SQLite returns (busy: int, log: int, checkpointed: int).
+            # busy=1 means another connection had the WAL pinned during
+            # the call; the next cycle will retry (cross-cycle retry --
+            # never spin/back-off in-process under contention).
+            return (int(row[0]), int(row[1]), int(row[2]))
+
+    def purge_stale_servers(self, now: float, ttl: float) -> int:
+        """Hard-delete server rows whose ``last_heartbeat`` is older than
+        ``now - ttl``. Distinct from ``list_live_servers`` (which filters
+        non-destructively on read) -- this is the data-layer cleanup
+        the maintenance loop drives.
+
+        Returns the count of rows actually deleted.
+        """
+        with self._lock, self._conn:
+            cur = self._conn.cursor()
+            cur.execute(
+                "DELETE FROM servers WHERE last_heartbeat < ?",
+                (now - ttl,),
+            )
+            return cur.rowcount
+
     def close(self) -> None:
         # sqlite3.Connection.close() is idempotent (safe to call twice --
         # the second call is a no-op). On Windows runners, leaving the
@@ -290,3 +369,87 @@ def default_storage() -> Storage:
         return InMemoryStorage()
     db_path = Path(os.environ.get("MATCHMAKER_DB", "matchmaker.db"))
     return SqliteStorage(db_path)
+
+
+# ---------------------------------------------------------------------------
+# Maintenance loop -- background WAL checkpoint + stale-server purge
+# ---------------------------------------------------------------------------
+#
+# The matchmaker's main() spawns run_maintenance_loop() on a daemon thread
+# keyed off the --maintenance-interval-sec CLI flag. The loop is
+# interruptible via threading.Event so test fixtures can deterministically
+# join the thread without flakiness. The body itself is backend-agnostic:
+# every SqliteStorage operation runs through the per-instance RLock, so a
+# concurrent Flask request handler (e.g. a /api/heartbeat mid-cycle)
+# queues behind the cycle and vice versa -- no shared-state corruption.
+#
+# Cross-cycle retry on busy PRAGMA: if checkpoint_wal() returns busy=1
+# because another connection (e.g. CI's start_all.py) had the WAL pinned,
+# we log the contention and let the next cycle try again. Never spin or
+# back-off in-process -- that would amplify contention.
+
+
+MAINTENANCE_PURGE_TTL_SEC = 300.0  # 5x SERVER_TTL_SEC=60; grace period
+                                    # for temporarily disconnected servers
+                                    # before a hard DELETE lands.
+
+
+def run_maintenance_loop(
+    storage: Storage,
+    *,
+    interval_s: float,
+    stop_event: "threading.Event",
+) -> None:
+    """Background loop: WAL checkpoint + stale-server purge every ``interval_s``.
+
+    Each cycle:
+      1. ``storage.checkpoint_wal()`` -- PRAGMA wal_checkpoint(TRUNCATE)
+         for the SqliteStorage backend; (0,0,0) for InMemoryStorage.
+      2. ``storage.purge_stale_servers(now, MAINTENANCE_PURGE_TTL_SEC)``
+         -- DELETE FROM servers WHERE last_heartbeat < now - 300.
+
+    Threshold logging: a cycle emits a single ``[maintenance] ...`` line
+    on stderr ONLY when there's actual ops work (rows purged > 0, WAL
+    pages checkpointed > 0, or WAL busy=1 contention). Empty cycles are
+    silent so a multi-day uptime doesn't spam logs in steady state.
+
+    Loop-exit semantics:
+      - ``interval_s <= 0``  -- run EXACTLY one cycle then return. This
+        is the test-mode entry point and lets unit tests assert
+        post-cycle invariants without threading races.
+      - ``interval_s > 0``   -- loop until ``stop_event.set()`` is called.
+        Between cycles ``stop_event.wait(interval_s)`` blocks; the
+        wait doubles as the stop-check so the loop can be torn down
+        from another thread without polling.
+
+    The function never raises -- per-cycle exceptions are caught and
+    logged so a transient SQLite fault doesn't kill the daemon thread.
+    """
+    while True:
+        try:
+            busy, log_pages, ckpt_pages = storage.checkpoint_wal()
+            purged = storage.purge_stale_servers(
+                time.time(), MAINTENANCE_PURGE_TTL_SEC,
+            )
+            if purged > 0 or ckpt_pages > 0 or busy:
+                sys.stderr.write(
+                    f"[maintenance] purged={purged} wal_busy={busy} "
+                    f"wal_log_pages={log_pages} "
+                    f"wal_checkpointed={ckpt_pages}\n"
+                )
+                sys.stderr.flush()
+        except Exception as e:
+            sys.stderr.write(
+                f"[maintenance] cycle error: {type(e).__name__}: {e}\n"
+            )
+            sys.stderr.flush()
+            if interval_s <= 0:
+                return
+            if stop_event.wait(interval_s):
+                return
+            continue
+        # One cycle completed cleanly. Decide whether to loop.
+        if interval_s <= 0:
+            return
+        if stop_event.wait(interval_s):
+            return  # stop_event.set() was called during the wait
